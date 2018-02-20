@@ -1,6 +1,7 @@
 import re
 import json
 
+
 def _time_code_to_seconds(code):
     """ converts a time code into actual seconds """
     try:
@@ -16,9 +17,9 @@ def _time_code_to_seconds(code):
         lookup = {
             "s": 1,
             "m": 60,
-            "h": 60*60,
-            "d": 24*60*60,
-            "w": 7*24*60*60,
+            "h": 60 * 60,
+            "d": 24 * 60 * 60,
+            "w": 7 * 24 * 60 * 60,
         }
         seconds = quant * lookup[scale]
     return seconds
@@ -38,7 +39,7 @@ def _extract_args(sig_args, sig_defaults, args, kwargs, whitelist, blacklist):
     all_args.update(kwargs)
     if sig_defaults:
         for i, defl in enumerate(sig_defaults):
-            name = sig_args[-(i+1)]
+            name = sig_args[-(i + 1)]
             all_args[name] = defl
 
     # now that we have our mapping of arg name to value, filter through it using
@@ -50,7 +51,7 @@ def _extract_args(sig_args, sig_defaults, args, kwargs, whitelist, blacklist):
             to_use[key] = val
 
     elif blacklist is not None:
-        for key,val in all_args.items():
+        for key, val in all_args.items():
             if key not in blacklist:
                 to_use[key] = val
 
@@ -60,7 +61,19 @@ def _extract_args(sig_args, sig_defaults, args, kwargs, whitelist, blacklist):
     return to_use
 
 
+class JSONEncoder(json.JSONEncoder):
+    """ custom json serializer for our key-serializing function.  knows how to
+    serialize things like sets """
+    def default(self, obj):
+        if isinstance(obj, set):
+            obj = list(obj)
+            obj.sort()
+            return obj
+
+        return json.JSONEncoder.default(self, obj)
+
+
 def _json_keyify(args):
     """ converts arguments into a deterministic key used for memoizing """
     args = tuple(sorted(args.items(), key=lambda e: e[0]))
-    return json.dumps(args)
+    return json.dumps(args, cls=JSONEncoder)

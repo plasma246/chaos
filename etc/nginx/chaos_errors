@@ -1,0 +1,18 @@
+server {
+    listen 8081;
+    listen [::]:8081 ipv6only=on;
+
+    root /root/workspace/Chaos/log;
+    index index.html index.htm;
+
+    # Make site outside accessible
+    server_name 0.0.0.0;
+
+    location / {
+        autoindex on;
+        try_files $uri $uri/ =404;
+        location ~* \.log$ {
+            add_header Content-Type text/plain;
+        }
+    }
+}

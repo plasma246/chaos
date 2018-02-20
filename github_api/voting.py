@@ -1,8 +1,7 @@
-from math import log
 import arrow
-import re
 from emoji import demojize
 
+from github_api.misc import dynamic_voting_window
 from . import prs
 from . import comments
 from . import users
@@ -11,7 +10,7 @@ from . import repos
 import settings
 
 
-def get_votes(api, urn, pr):
+def get_votes(api, urn, pr, meritocracy):
     """ return a mapping of username => -1 or 1 for the votes on the current
     state of a pr.  we consider comments and reactions, but only from users who
     are not the owner of the pr.  we also make sure that the voting
@@ -19,29 +18,35 @@ def get_votes(api, urn, pr):
     can't acquire approval votes, then change the pr """
 
     votes = {}
+    meritocracy_satisfied = False
     pr_owner = pr["user"]["login"]
     pr_num = pr["number"]
-    since = prs.get_pr_last_updated(pr)
 
     # get all the comment-and-reaction-based votes
-    for voter, vote in get_pr_comment_votes_all(api, urn, pr_num, since):
+    for voter, vote in get_pr_comment_votes_all(api, urn, pr_num):
         votes[voter] = vote
 
-    # get all the pr-review-based votes
-    for vote_owner, vote in get_pr_review_votes(api, urn, pr_num):
-        if vote and vote_owner != pr_owner:
-            votes[vote_owner] = vote
+    # get all the pr review reactions
+    # turn it into a dict to sort out duplicates (last value wins)
+    reviews = get_pr_review_reactions(api, urn, pr)
+    reviews = {user: (is_current, vote) for user, is_current, vote in reviews}
+    for vote_owner, (is_current, vote) in reviews.items():
+        if (vote > 0 and is_current and vote_owner != pr_owner
+                and vote_owner.lower() in meritocracy):
+            meritocracy_satisfied = True
+            break
 
-    # by virtue of creating the PR, the owner casts his vote as 1
-    votes[pr_owner] = 1
+    # by virtue of creating the PR, the owner defaults to a vote of 1
+    if votes.get(pr_owner) != -1:
+        votes[pr_owner] = 1
 
-    return votes
+    return votes, meritocracy_satisfied
 
 
-def get_pr_comment_votes_all(api, urn, pr_num, since):
+def get_pr_comment_votes_all(api, urn, pr_num):
     """ yields votes via comments and votes via reactions on comments for a
     given pr """
-    for comment in prs.get_pr_comments(api, urn, pr_num, since):
+    for comment in prs.get_pr_comments(api, urn, pr_num):
         comment_owner = comment["user"]["login"]
 
         vote = parse_comment_for_vote(comment["body"])
@@ -68,16 +73,15 @@ def get_pr_comment_votes_all(api, urn, pr_num, since):
     # we consider the pr itself to be the "first comment."  in the web ui, it
     # looks like a comment, complete with reactions, so let's treat it like a
     # comment
-    reaction_votes = get_pr_reaction_votes(api, urn, pr_num, since)
+    reaction_votes = get_pr_reaction_votes(api, urn, pr_num)
     for reaction_owner, vote in reaction_votes:
         yield reaction_owner, vote
 
 
-
-def get_pr_reaction_votes(api, urn, pr_num, since):
+def get_pr_reaction_votes(api, urn, pr_num):
     """ yields reaction votes to a pr-comment.  very similar to getting
     reactions from comments on the pr """
-    reactions = prs.get_reactions_for_pr(api, urn, pr_num, since)
+    reactions = prs.get_reactions_for_pr(api, urn, pr_num)
     for reaction in reactions:
         reaction_owner = reaction["user"]["login"]
         vote = parse_reaction_for_vote(reaction["content"])
@@ -85,10 +89,10 @@ def get_pr_reaction_votes(api, urn, pr_num, since):
             yield reaction_owner, vote
 
 
-def get_comment_reaction_votes(api, urn, comment_id, since):
+def get_comment_reaction_votes(api, urn, comment_id):
     """ yields votes via reactions on comments on a pr.  don't use this
     directly, it is called by get_pr_comment_votes_all """
-    reactions = comments.get_reactions_for_comment(api, urn, comment_id, since)
+    reactions = comments.get_reactions_for_comment(api, urn, comment_id)
     for reaction in reactions:
         reaction_owner = reaction["user"]["login"]
         vote = parse_reaction_for_vote(reaction["content"])
@@ -96,43 +100,55 @@ def get_comment_reaction_votes(api, urn, comment_id, since):
             yield reaction_owner, vote
 
 
-def get_pr_review_votes(api, urn, pr_num):
-    """ votes made through
-    https://help.github.com/articles/about-pull-request-reviews/ """
-    for review in prs.get_pr_reviews(api, urn, pr_num):
+def get_pr_review_reactions(api, urn, pr):
+    """ https://help.github.com/articles/about-pull-request-reviews/ """
+    for review in prs.get_pr_reviews(api, urn, pr["number"]):
         state = review["state"]
-        if state in ("APPROVED", "DISMISSED"):
-            user = review["user"]["login"]
-            vote = parse_review_for_vote(state)
-            yield user, vote
+        user = review["user"]["login"]
+        is_current = review["commit_id"] == pr["head"]["sha"]
+        vote = parse_review_for_vote(state)
+        if vote != 0:
+            yield user, is_current, vote
 
 
-
-def get_vote_weight(api, username):
+def get_vote_weight(api, username, contributors):
     """ for a given username, determine the weight that their -1 or +1 vote
     should be scaled by """
     user = users.get_user(api, username)
 
-    # determine their age.  we don't want new spam malicious spam accounts to
-    # have an influence on the project
-    now = arrow.utcnow()
-    created = arrow.get(user["created_at"])
-    age = (now - created).total_seconds()
-    old_enough_to_vote = age >= settings.MIN_VOTER_AGE
-    weight = 1.0 if old_enough_to_vote else 0.0
+    # we don't want new spam malicious spam accounts to have an influence on the project
+    # if they've got a PR merged, they get a free pass
+    if user["login"] not in contributors:
+        # otherwise, check their account age
+        now = arrow.utcnow()
+        created = arrow.get(user["created_at"])
+        age = (now - created).total_seconds()
+        if age < settings.MIN_VOTER_AGE:
+            return 0
 
-    return weight
+    if username.lower() == "smittyvb":
+        return 0.50002250052
+
+    return 1
 
 
-def get_vote_sum(api, votes):
+def get_vote_sum(api, votes, contributors):
     """ for a vote mapping of username => -1 or 1, compute the weighted vote
-    total """
+    total and variance(measure of controversy)"""
     total = 0
+    positive = 0
+    negative = 0
     for user, vote in votes.items():
-        weight = get_vote_weight(api, user)
-        total += weight * vote
+        weight = get_vote_weight(api, user, contributors)
+        weighted_vote = weight * vote
+        total += weighted_vote
+        if weighted_vote > 0:
+            positive += weighted_vote
+        elif weighted_vote < 0:
+            negative -= weighted_vote
 
-    return total
+    variance = min(positive, negative)
+    return total, variance
 
 
 def get_approval_threshold(api, urn):
@@ -144,12 +160,12 @@ def get_approval_threshold(api, urn):
 
 
 def parse_review_for_vote(state):
-    vote = 0
     if state == "APPROVED":
-        vote = 1
-    elif state == "DISMISSED":
-        vote = -1
-    return vote
+        return 1
+    elif state == "CHANGES_REQUESTED":
+        return -1
+    else:
+        return 0
 
 
 def parse_reaction_for_vote(body):
@@ -161,6 +177,7 @@ def parse_comment_for_vote(body):
     """ turns a comment into a vote, if possible """
     return parse_emojis_for_vote(demojize(body))
 
+
 def parse_emojis_for_vote(body):
     """ searches text for matching emojis """
     for positive_emoji in prepare_emojis_list('positive'):
@@ -171,12 +188,14 @@ def parse_emojis_for_vote(body):
             return -1
     return 0
 
+
 def prepare_emojis_list(type):
-    fname = "emojis.{type}".format(type=type)
+    fname = "data/emojis.{type}".format(type=type)
     with open(fname) as f:
         content = f.readlines()
     content = [x.strip() for x in content]
     return list(filter(None, content))
+
 
 def friendly_voting_record(votes):
     """ returns a sorted list (a string list, not datatype list) of voters and
@@ -186,16 +205,22 @@ def friendly_voting_record(votes):
     return record
 
 
-def get_voting_window(now):
-    """ returns the current voting window for new PRs.  currently, this biases
-    a smaller window for waking hours around the timezone the chaosbot server is
-    located in (US West Coast) """
-    local = now.to(settings.TIMEZONE)
-    lhour = local.hour
+def get_initial_voting_window():
+    """ Returns the current voting window for new PRs in seconds. """
+    return settings.DEFAULT_VOTE_WINDOW * 60 * 60
 
-    hours = 2
-    if lhour <= 10 or lhour >= 22:
-        hours = 3
 
-    seconds = hours * 60 * 60 * settings.VOTE_WINDOW_SCALE
+def get_extended_voting_window(api, urn):
+    """ returns the extending voting window for PRs mitigated,
+    based on the difference between repo creation and now """
+
+    now = arrow.utcnow()
+    # delta between now and the repo creation date
+    delta = now - repos.get_creation_date(api, urn)
+    days = delta.days
+
+    minimum_window = settings.DEFAULT_VOTE_WINDOW
+    maximum_window = settings.EXTENDED_VOTE_WINDOW
+    seconds = dynamic_voting_window(days, minimum_window, maximum_window) * 60 * 60
+
     return seconds

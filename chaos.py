@@ -1,129 +1,165 @@
-import time
-import os
-import sys
-import sh
-from os.path import dirname, abspath, join
-import logging
-import threading
-import http.server
-import random
-import subprocess
-import arrow
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
 
+from os.path import exists
+import os
+import time
+import sys
+import logging
+import subprocess
 import settings
+import schedule
+import cron
+import shutil
+import datetime
+
+# this import must happen before any github api stuff gets imported.  it sets
+# up caching on the api functions so we don't run out of api requests
+import patch  # noqa: F401
 
 import github_api as gh
 import github_api.prs
 import github_api.voting
 import github_api.repos
 import github_api.comments
-from github_api import exceptions as gh_exc
+import github_api.issues
 
-import patch
+# Has a sideeffect of creating private key if one doesn't exist already
+# Currently imported just for the sideeffect (not currently being used)
+import encryption  # noqa: F401
 
-
-THIS_DIR = dirname(abspath(__file__))
-
-logging.basicConfig(level=logging.DEBUG)
-logging.getLogger("requests").propagate = False
-logging.getLogger("sh").propagate = False
-
-log = logging.getLogger("chaosbot")
-
-api = gh.API(settings.GITHUB_USER, settings.GITHUB_SECRET)
-
-fortunes = []
-with open("fortunes.txt", "r", encoding="utf8") as f:
-    fortunes = f.read().split("\n%\n")
-
-class HTTPServerRequestHandler(http.server.BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.send_header("Content-type", "text/html; charset=utf-8")
-        self.end_headers()
-
-        self.wfile.write(random.choice(fortunes).encode("utf8"))
-
-def update_self_code():
-    """ pull the latest commits from master """
-    sh.git.pull("origin", "master")
+# To make post in Twitter
+import twitter_api as ta
+# import twitter_api.misc
+# import twitter_api.Twitter
 
 
-def restart_self():
-    """ restart our process """
-    os.execl(sys.executable, sys.executable, *sys.argv)
+class LessThanFilter(logging.Filter):
+    """
+    Source: https://stackoverflow.com/questions/2302315
+    """
+    def __init__(self, exclusive_maximum, name=""):
+        super(LessThanFilter, self).__init__(name)
+        self.max_level = exclusive_maximum
+
+    def filter(self, record):
+        """
+        non-zero return means we log this message
+        """
+        return 1 if record.levelno < self.max_level else 0
 
 
-def http_server():
-    s = http.server.HTTPServer(('', 8080), HTTPServerRequestHandler)
-    s.serve_forever()
+def main():
+    # Set up logging stuff
+    logging_handler_out = logging.StreamHandler(sys.stdout)
+    logging_handler_out.setLevel(settings.LOG_LEVEL_OUT)
+    logging_handler_out.addFilter(LessThanFilter(settings.LOG_LEVEL_ERR))
 
-def start_http_server():
-    http_server_thread = threading.Thread(target=http_server)
-    http_server_thread.start()
+    logging_handler_err = logging.StreamHandler(sys.stderr)
+    logging_handler_err.setLevel(settings.LOG_LEVEL_ERR)
 
-def install_requirements():
-    """install or update requirements"""
-    os.system("pip install -r requirements.txt")
+    logging.basicConfig(level=logging.NOTSET,
+                        format='%(asctime)s %(name)-12s %(levelname)-8s %(message)s',
+                        datefmt='%m-%d %H:%M',
+                        handlers=[logging_handler_out, logging_handler_err])
+
+    logging.getLogger("requests").propagate = False
+    logging.getLogger("sh").propagate = False
+    logging.getLogger("peewee").propagate = False
+
+    log = logging.getLogger("chaosbot")
+
+    if exists("voters.json"):
+        log.info("Moving voters.json to server directory!")
+        shutil.move("./voters.json", "./server/voters.json")
+
+    api = gh.API(settings.GITHUB_USER, settings.GITHUB_SECRET)
+
+    # Api Twitter
+    api_twitter = ta.API_TWITTER(settings.TWITTER_API_KEYS_FILE)
+
+    log.info("checking if I crashed before...")
+    ta.Twitter.PostTwitter(datetime.datetime.ctime(datetime.datetime.now()) +
+                           " - checking if I crashed before...",
+                           api_twitter.GetApi())
+
+    # check if chaosbot is not on the tip of the master branch
+    check_for_prev_crash(api, log)
+
+    log.info("starting up and entering event loop")
+    ta.Twitter.PostTwitter(datetime.datetime.ctime(datetime.datetime.now()) +
+                           " - starting up and entering event loop",
+                           api_twitter.GetApi())
+
+    os.system("pkill uwsgi")
+
+    subprocess.Popen(["/root/.virtualenvs/chaos/bin/uwsgi",
+                      "--socket", "127.0.0.1:8085",
+                      "--wsgi-file", "webserver.py",
+                      "--callable", "__hug_wsgi__",
+                      "--check-static", "/root/workspace/Chaos/server/",
+                      "--daemonize", "/root/workspace/Chaos/log/uwsgi.log"])
+
+    # Schedule all cron jobs to be run
+    cron.schedule_jobs(api, api_twitter)
+
+    log.info("Setting description to {desc}".format(desc=settings.REPO_DESCRIPTION))
+    github_api.repos.set_desc(api, settings.URN, settings.REPO_DESCRIPTION)
+
+    log.info("Ensure creation of issue/PR labels")
+    for label, color in settings.REPO_LABELS.items():
+        github_api.repos.create_label(api, settings.URN, label, color)
+
+    while True:
+        # Run any scheduled jobs on the next second.
+        schedule.run_pending()
+        time.sleep(1)
+
+
+def check_for_prev_crash(api, log):
+    """
+    Check if Chaosbot is attempting a recovery from a failure. If it is, then
+    read the failure file created by chaos_wrapper.sh and make a github issue
+    for the failure.
+    """
+    if exists(settings.CHAOSBOT_FAILURE_FILE):
+        with open(settings.CHAOSBOT_FAILURE_FILE, "r") as cff:
+            log.info("it looks like I did... posting on github...")
+
+            # read the failure file... the format is
+            #
+            #   FAILED_GIT_SHA CURRENT_GIT_SHA
+            #
+            # where FAILED_GIT_SHA is the one that crashed, and CURRENT_GIT_SHA
+            # is the one currently running.
+            failed, current = cff.readline().split(" ")
+
+            # read the error log
+            # Currently, I'm just reading the last 200 lines... which I think
+            # ought to be enough, but if anyone has a better way to do this,
+            # please do it.
+            dump = subprocess.check_output(["tail", "-n", "200", settings.CHAOSBOT_STDERR_LOG])
+
+            # Create a github issue for the problem
+            title = "Help! I crashed! --CB"
+            labels = ["crash report"]
+            body = """
+Oh no! I crashed!
+
+Failed on SHA {failed}
+Rolled back to SHA {current}
+
+Error log:
+```
+{dump}
+```
+""".format(failed=failed, current=current, dump=bytes.decode(dump))
+
+            gh.issues.create_issue(api, settings.URN, title, body, labels)
+
+            # remove the error file
+            os.remove(settings.CHAOSBOT_FAILURE_FILE)
+
 
 if __name__ == "__main__":
-    logging.info("starting up and entering event loop")
-    
-    os.system("pkill chaos_server")
-    subprocess.Popen([sys.executable, "server.py"], cwd=join(THIS_DIR, "server"))
-    
-    log.info("starting http server")
-    start_http_server()
-    
-    while True:
-        log.info("looking for PRs")
-
-        now = arrow.utcnow()
-        voting_window = gh.voting.get_voting_window(now)
-        prs = gh.prs.get_ready_prs(api, settings.URN, voting_window)
-
-        needs_update = False
-        for pr in prs:
-            pr_num = pr["number"]
-            logging.info("processing PR #%d", pr_num)
-
-            votes = gh.voting.get_votes(api, settings.URN, pr)
-        
-            # is our PR approved or rejected?
-            vote_total = gh.voting.get_vote_sum(api, votes)
-            threshold = gh.voting.get_approval_threshold(api, settings.URN)
-            is_approved = vote_total >= threshold
-
-            if is_approved:
-                log.info("PR %d approved for merging!", pr_num)
-                try:
-                    gh.prs.merge_pr(api, settings.URN, pr, votes, vote_total,
-                            threshold)
-                # some error, like suddenly there's a merge conflict, or some
-                # new commits were introduced between findint this ready pr and
-                # merging it
-                except gh_exc.CouldntMerge:
-                    log.info("couldn't merge PR %d for some reason, skipping",
-                            pr_num)
-                    gh.prs.label_pr(api, settings.URN, pr_num, ["can't merge"])
-                    continue
-
-                gh.prs.label_pr(api, settings.URN, pr_num, ["accepted"])
-                needs_update = True
-
-            else:
-                log.info("PR %d rejected, closing", pr_num)
-                gh.comments.leave_reject_comment(api, settings.URN, pr_num)
-                gh.prs.label_pr(api, settings.URN, pr_num, ["rejected"])
-                gh.prs.close_pr(api, settings.URN, pr)
-
-
-        # we approved a PR, restart
-        if needs_update:
-            logging.info("updating code and requirements and restarting self")
-            update_self_code()
-            install_requirements()
-            restart_self()
-
-        logging.info("sleeping for %d seconds", settings.SLEEP_TIME)
-        time.sleep(settings.SLEEP_TIME)
+    main()

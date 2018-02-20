@@ -1,6 +1,7 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
 import praw
-from praw.models import MoreComments
-import pprint
 
 
 '''Authenticated instance of Reddit'''
@@ -25,7 +26,6 @@ submission.comment_sort = 'new'
 top_level_comments = list(submission.comments)
 newcom = top_level_comments[1]
 print(newcom.body)
-
 
 
 '''FIND COMMENTS ABOUT CHAOS'''
